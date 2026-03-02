@@ -224,20 +224,6 @@ class MultimodalEncoder(nn.Module):
         self.radar_encoder = RadarEncoder(feature_dim)
         self.lidar_encoder = LiDAREncoder(feature_dim, pretrained)
         self.gps_encoder = GPSEncoder(feature_dim)
-        self.gps_ema_beta = float(max(0.0, min(0.99, gps_ema_beta)))
-        self.post_norms = nn.ModuleDict({
-            "image": nn.LayerNorm(feature_dim),
-            "radar": nn.LayerNorm(feature_dim),
-            "lidar": nn.LayerNorm(feature_dim),
-            "gps": nn.LayerNorm(feature_dim),
-        })
-        self.modality_scales = nn.ParameterDict({
-            "image": nn.Parameter(torch.tensor(1.0)),
-            "radar": nn.Parameter(torch.tensor(1.0)),
-            "lidar": nn.Parameter(torch.tensor(1.0)),
-            # GPS starts slightly down-weighted to reduce shortcut reliance.
-            "gps": nn.Parameter(torch.tensor(0.5)),
-        })
 
     def forward(self, images: torch.Tensor, radars: torch.Tensor,
                 lidars: torch.Tensor, gps: torch.Tensor):
@@ -255,13 +241,6 @@ class MultimodalEncoder(nn.Module):
         """
         B, H = images.shape[:2]
 
-        if self.gps_ema_beta > 0.0 and H > 1:
-            gps_s = [gps[:, 0]]
-            beta = self.gps_ema_beta
-            for t in range(1, H):
-                gps_s.append(beta * gps_s[-1] + (1.0 - beta) * gps[:, t])
-            gps = torch.stack(gps_s, dim=1)
-
         # Reshape to process all frames at once: (B*H, ...)
         img_flat = images.reshape(B * H, *images.shape[2:])
         rad_flat = radars.reshape(B * H, *radars.shape[2:])
@@ -275,12 +254,9 @@ class MultimodalEncoder(nn.Module):
         gps_feat = self.gps_encoder(gps_flat)  # (B*H, M)
 
         # Reshape back: (B, H, M)
-        out = {
+        return {
             "image": img_feat.reshape(B, H, -1),
             "radar": rad_feat.reshape(B, H, -1),
             "lidar": lid_feat.reshape(B, H, -1),
             "gps": gps_feat.reshape(B, H, -1),
         }
-        for mod, feat in out.items():
-            out[mod] = self.post_norms[mod](feat) * self.modality_scales[mod]
-        return out

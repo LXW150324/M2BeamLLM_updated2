@@ -45,6 +45,7 @@ def build_model(cfg: Config, backbone: str, device: torch.device,
         num_unfrozen_layers=cfg.model.num_unfrozen_layers,
         num_adapter_layers=getattr(cfg.model, "num_adapter_layers", 2),
         T=T, H=H,
+        # C1 params
         buffer_size=cfg.async_align.buffer_size,
         staleness_embed_dim=cfg.async_align.staleness_embed_dim,
         max_staleness_ms=cfg.async_align.max_staleness_ms,
@@ -54,6 +55,7 @@ def build_model(cfg: Config, backbone: str, device: torch.device,
         delay_boundaries=cfg.async_align.delay_regime_boundaries,
         residual_hidden=cfg.async_align.residual_mlp_hidden,
         regime_adapter_dim=cfg.async_align.regime_adapter_dim,
+        # C2 params
         variance_head_hidden=cfg.reliability.variance_head_hidden,
         reliability_min=cfg.reliability.reliability_min,
         reliability_logvar_clip=getattr(cfg.reliability, "logvar_clip", None),
@@ -61,43 +63,24 @@ def build_model(cfg: Config, backbone: str, device: torch.device,
         reliability_uniform_mix=getattr(cfg.reliability, "uniform_mix", 0.0),
         reliability_ema_beta=getattr(cfg.reliability, "ema_beta", 0.0),
         reliability_pair_conf_threshold=getattr(cfg.reliability, "pair_conf_threshold", 0.0),
-        reliability_degradation_cue_mix=getattr(cfg.reliability, "degradation_cue_mix", 0.5),
-        reliability_degradation_prior_scale=getattr(cfg.reliability, "degradation_prior_scale", 1.5),
-        degradation_observation_keep_scale=getattr(cfg.model, "degradation_observation_keep_scale", 2.5),
-        degradation_observation_keep_min=getattr(cfg.model, "degradation_observation_keep_min", 0.35),
-        degradation_temporal_prior_scale=getattr(cfg.model, "degradation_temporal_prior_scale", 0.85),
-        degradation_temporal_big_jump_penalty=getattr(cfg.model, "degradation_temporal_big_jump_penalty", 0.50),
-        degradation_temporal_neighbor_radius=getattr(cfg.model, "degradation_temporal_neighbor_radius", 2),
-        degradation_temporal_prior_max_boost=getattr(cfg.model, "degradation_temporal_prior_max_boost", 1.25),
-        history_anchor_scale=getattr(cfg.model, "history_anchor_scale", 0.0),
-        history_anchor_decay=getattr(cfg.model, "history_anchor_decay", 0.8),
-        history_anchor_big_jump_penalty=getattr(cfg.model, "history_anchor_big_jump_penalty", 0.0),
-        history_anchor_neighbor_radius=getattr(cfg.model, "history_anchor_neighbor_radius", 2),
         alignment_proj_dim=cfg.reliability.alignment_projection_dim,
         num_fusion_tokens=cfg.model.num_fusion_tokens,
+        # C3 params
         num_experts=cfg.moe_lora.num_experts,
         lora_rank=cfg.moe_lora.lora_rank,
         lora_alpha=cfg.moe_lora.lora_alpha,
         lora_dropout=cfg.moe_lora.lora_dropout,
         router_extra_dim=(8 if getattr(cfg.moe_lora, "use_router_extra_context", False) else 0),
+        # Fusion params
         num_attention_heads=cfg.model.num_attention_heads,
         fusion_dropout=cfg.model.fusion_dropout,
         ffn_hidden_dim=cfg.model.ffn_hidden_dim,
+        # A5 baseline params
         vanilla_hidden_dim=getattr(cfg.model, "vanilla_hidden_dim", cfg.model.llm_hidden_dim),
         vanilla_num_layers=cfg.model.vanilla_num_layers,
         vanilla_num_heads=cfg.model.vanilla_num_heads,
         vanilla_ffn_hidden_dim=cfg.model.vanilla_ffn_hidden_dim,
         vanilla_dropout=cfg.model.vanilla_dropout,
-        use_beam_history=getattr(cfg.model, "use_beam_history", False),
-        beam_history_dropout=getattr(cfg.model, "beam_history_dropout", 0.1),
-        use_autoregressive_decoder=getattr(cfg.model, "use_autoregressive_decoder", False),
-        ar_decoder_hidden_dim=getattr(cfg.model, "ar_decoder_hidden_dim", 128),
-        ar_decoder_dropout=getattr(cfg.model, "ar_decoder_dropout", 0.1),
-        gps_ema_beta=getattr(cfg.model, "gps_ema_beta", 0.0),
-        use_pairwise_reranker=getattr(cfg.model, "use_pairwise_reranker", False),
-        pairwise_reranker_feature_dim=getattr(cfg.model, "pairwise_reranker_feature_dim", 24),
-        pairwise_reranker_hidden_dim=getattr(cfg.model, "pairwise_reranker_hidden_dim", 64),
-        pairwise_reranker_dropout=getattr(cfg.model, "pairwise_reranker_dropout", 0.1),
     ).to(device)
     return model
 
@@ -974,21 +957,11 @@ def evaluate(model: RobustM2BeamLLM,
             degradation_cues=batch_dict.get("_degradation_cues"),
             beam_history=beam_history,
         )
-        predictions = _apply_valid_beam_mask(predictions, criterion)
         loss, _ = criterion(
             predictions, targets, aux,
             use_reliability_align=use_reliability_align,
         )
-        predictions_eval = _maybe_postprocess_eval_predictions(
-            predictions,
-            beam_history,
-            aux,
-            s_ms,
-            batch_dict["gps"],
-            model,
-            cfg,
-        )
-        predictions_eval = _apply_valid_beam_mask(predictions_eval, criterion)
+        predictions_eval = predictions
 
         if "reliability_weights" in aux and "log_variances" in aux:
             rel_stack = []
