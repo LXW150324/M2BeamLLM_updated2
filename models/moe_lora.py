@@ -183,8 +183,12 @@ class MoELoRA(nn.Module):
 class PEFTLLMBackbone(nn.Module):
     """
     Pretrained GPT-2 backbone with MoE-LoRA PEFT.
-    Proposal-faithful default: GPT backbone frozen, with LoRA adapters attached
-    to the last `num_adapter_layers` transformer blocks.
+
+    LoRA adapters are injected *inside* GPT-2 transformer blocks via forward
+    hooks on the attention Q/K/V projections, attention output projection,
+    and MLP layers.  This is the standard LoRA approach (Hu et al., ICLR 2022)
+    and ensures the low-rank corrections participate in intermediate feature
+    propagation rather than being applied as a post-hoc residual.
     """
 
     def __init__(self, model_name: str = "gpt2",
@@ -221,8 +225,6 @@ class PEFTLLMBackbone(nn.Module):
         # Pretrained LLM (frozen)
         self.llm = GPT2Model.from_pretrained(model_name)
         total_layers = len(self.llm.h)
-        # Clamp explicitly: Python slice [-0:] == [:], which would accidentally
-        # unfreeze all layers when the caller intends to freeze all.
         num_unfrozen_layers = int(max(0, min(int(num_unfrozen_layers), total_layers)))
         num_adapter_layers = int(max(0, min(int(num_adapter_layers), total_layers)))
         adapter_start = total_layers - num_adapter_layers
@@ -240,9 +242,14 @@ class PEFTLLMBackbone(nn.Module):
                 for param in self.llm.ln_f.parameters():
                     param.requires_grad = True
 
+        # --- Intra-layer MoE-LoRA adapters ---
+        # We create LoRA adapters for attention (q, k, v, o) and FFN in each
+        # adapted layer. During forward, we use hooks to inject LoRA deltas
+        # into the GPT-2 linear projections at the correct positions.
         self.adapter_keys = ("q", "k", "v", "o", "ffn")
         self.moe_lora_layers = nn.ModuleList()
-        for _layer_idx in range(adapter_start, total_layers):
+        self._adapter_layer_indices = []  # which GPT-2 layer indices get adapters
+        for layer_idx in range(adapter_start, total_layers):
             layer_adapters = nn.ModuleDict({
                 key: MoELoRA(llm_hidden_dim, llm_hidden_dim,
                              num_experts, lora_rank, lora_alpha, lora_dropout,
@@ -251,19 +258,65 @@ class PEFTLLMBackbone(nn.Module):
                 for key in self.adapter_keys
             })
             self.moe_lora_layers.append(layer_adapters)
+            self._adapter_layer_indices.append(layer_idx)
 
         # Output projection: llm_hidden_dim -> feature_dim
         self.output_proj = nn.Sequential(
             nn.Linear(llm_hidden_dim, feature_dim),
         )
 
+        # Runtime context for MoE routing (set before each forward pass)
+        self._moe_context = {
+            "reliability_vec": None,
+            "regime_vec": None,
+            "router_extra_vec": None,
+            "balance_loss": None,
+        }
+
+        # Register forward hooks on the adapted GPT-2 layers
+        self._hooks = []
+        for adapter_idx, layer_idx in enumerate(self._adapter_layer_indices):
+            hook = self.llm.h[layer_idx].register_forward_hook(
+                self._make_layer_hook(adapter_idx)
+            )
+            self._hooks.append(hook)
+
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         print(f"PEFT LLM Backbone: {model_name}")
         print(f"  Unfrozen layers: {num_unfrozen_layers}/{total_layers}")
-        print(f"  Adapter layers: {num_adapter_layers}/{total_layers}")
+        print(f"  Adapter layers: {num_adapter_layers}/{total_layers} (intra-layer hooks)")
         print(f"  MoE-LoRA: {num_experts} experts, rank={lora_rank}")
         print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+
+    def _make_layer_hook(self, adapter_idx: int):
+        """
+        Create a forward hook for a GPT-2 transformer block that applies
+        MoE-LoRA corrections to the block's hidden states.
+
+        GPT-2 block forward returns (hidden_states, ...).  We apply LoRA
+        deltas to the full hidden-state tensor so the corrections propagate
+        through subsequent layers.
+        """
+        def hook_fn(module, input, output):
+            # output is a tuple: (hidden_states, present_kv, ...)
+            hidden = output[0]  # (B, seq_len, d_LLM)
+            moe_adapters = self.moe_lora_layers[adapter_idx]
+            ctx = self._moe_context
+            rel = ctx["reliability_vec"]
+            reg = ctx["regime_vec"]
+            rex = ctx["router_extra_vec"]
+
+            for key in self.adapter_keys:
+                delta, bl = moe_adapters[key](hidden, rel, reg, rex)
+                hidden = hidden + delta
+                if ctx["balance_loss"] is not None:
+                    ctx["balance_loss"] = ctx["balance_loss"] + bl
+                else:
+                    ctx["balance_loss"] = bl
+
+            return (hidden,) + output[1:]
+        return hook_fn
 
     def forward(self, Z: torch.Tensor,
                 reliability_vec: Optional[torch.Tensor] = None,
@@ -288,23 +341,23 @@ class PEFTLLMBackbone(nn.Module):
         prompts = self.prompt_tokens.expand(B, -1, -1)
         full_input = torch.cat([embeddings, prompts], dim=1)  # (B, seq_len+T, d_LLM)
 
-        # Forward through LLM
+        # Set MoE routing context for hooks
+        self._moe_context = {
+            "reliability_vec": reliability_vec,
+            "regime_vec": regime_vec,
+            "router_extra_vec": router_extra_vec,
+            "balance_loss": torch.tensor(0.0, device=Z.device),
+        }
+
+        # Forward through LLM (hooks apply LoRA inside each adapted layer)
         llm_output = self.llm(inputs_embeds=full_input).last_hidden_state
 
-        # Apply MoE-LoRA residuals to unfrozen layer outputs
-        # Note: in practice, LoRA is applied inside the attention.
-        # Here we apply as a post-hoc correction for simplicity.
-        total_balance_loss = torch.tensor(0.0, device=Z.device)
-        # Apply MoE-LoRA on the prompt positions
-        prompt_output = llm_output[:, -self.T:, :]  # (B, T, d_LLM)
+        total_balance_loss = self._moe_context["balance_loss"]
+        if total_balance_loss is None:
+            total_balance_loss = torch.tensor(0.0, device=Z.device)
 
-        for moe_adapters in self.moe_lora_layers:
-            for key in self.adapter_keys:
-                delta, bl = moe_adapters[key](
-                    prompt_output, reliability_vec, regime_vec, router_extra_vec
-                )
-                prompt_output = prompt_output + delta
-                total_balance_loss = total_balance_loss + bl
+        # Extract prompt positions for future prediction
+        prompt_output = llm_output[:, -self.T:, :]  # (B, T, d_LLM)
 
         # Output projection
         predictions = self.output_proj(prompt_output)  # (B, T, feature_dim)

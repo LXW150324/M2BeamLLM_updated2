@@ -461,9 +461,14 @@ class RobustM2BeamLLM(nn.Module):
                 router_extra_dim=self.router_extra_dim,
             )
 
-        # 7. Beam classification head
+        # 7. Beam classification head (2-layer MLP for better expressiveness)
         self.pred_dropout = nn.Dropout(0.1)
-        self.beam_classifier = nn.Linear(feature_dim, num_beams)
+        self.beam_classifier = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(feature_dim * 2, num_beams),
+        )
 
         # Optional extension branch (disabled by default to keep proposal-faithful path).
         self.beam_history_conditioner = (

@@ -76,11 +76,11 @@ class ReliabilityConfig:
 class MoELoRAConfig:
     """C3: MoE-LoRA PEFT parameters."""
     num_experts: int = 4              # E: number of MoE experts
-    lora_rank: int = 16
-    lora_alpha: float = 32.0
+    lora_rank: int = 32              # Increased from 16 for stronger adaptation
+    lora_alpha: float = 64.0         # Scaled with rank (alpha/rank = 2)
     lora_dropout: float = 0.05
     router_hidden_dim: int = 128      # router MLP hidden dim
-    use_router_extra_context: bool = False
+    use_router_extra_context: bool = True  # Enable extra context for better routing
 
 
 @dataclass
@@ -94,8 +94,8 @@ class SSLConfig:
     # explicit alignment/reliability are activated in Stage 2 supervision.
     use_explicit_alignment: bool = False
     use_reliability_gating: bool = False
-    ssl_epochs: int = 30
-    ssl_lr: float = 1e-3
+    ssl_epochs: int = 20             # Moderate SSL pretraining
+    ssl_lr: float = 5e-4              # Slightly lower to avoid feature space collapse
 
 
 @dataclass
@@ -127,11 +127,11 @@ class StressTestConfig:
 
 @dataclass
 class ModelConfig:
-    feature_dim: int = 64
+    feature_dim: int = 128            # Increased from 64: wider bottleneck for 64-beam classification
     llm_name: str = "gpt2"
     llm_hidden_dim: int = 768
-    num_unfrozen_layers: int = 0
-    num_adapter_layers: int = 2
+    num_unfrozen_layers: int = 2      # Unfreeze last 2 GPT-2 layers for task adaptation
+    num_adapter_layers: int = 4       # MoE-LoRA on last 4 layers for stronger adaptation
     num_attention_heads: int = 4
     fusion_dropout: float = 0.1
     ffn_hidden_dim: int = 256
@@ -188,31 +188,31 @@ class TrainConfig:
     lr_decay_step: int = 8
     weight_decay: float = 1e-4
 
-    lambda_align: float = 0.5
+    lambda_align: float = 0.3
     lambda_beam: float = 1.0
-    lambda_moe_balance: float = 0.0
+    lambda_moe_balance: float = 0.01   # Enable MoE load-balancing to prevent expert collapse
     lambda_prior_match: float = 0.0
     lambda_reliability_monopoly: float = 0.0
     lambda_cvar: float = 0.0
     reliability_monopoly_cap: float = 0.75
-    align_warmup_epochs: int = 0
-    use_class_balanced_loss: bool = False
+    align_warmup_epochs: int = 3       # Warm up alignment loss over 3 epochs
+    use_class_balanced_loss: bool = True  # Enable class-balanced loss for long-tail beam dist
     use_weighted_sampler: bool = False
     weighted_sampler_power: float = 0.5
     # Mask logits of beam IDs never seen in train_future labels.
     # Useful when codebook size is fixed (e.g., 64) but some IDs never occur.
-    mask_unseen_beams: bool = False
+    mask_unseen_beams: bool = True     # Mask unseen beam IDs to focus classifier capacity
     # Optional per-future-step loss weights (length T). If None, uniform.
     beam_step_weights: Optional[List[float]] = None
-    focal_gamma: float = 0.0
-    label_smoothing: float = 0.0
-    beam_soft_target_lambda: float = 0.0
+    focal_gamma: float = 1.0           # Mild focal loss to focus on hard examples
+    label_smoothing: float = 0.05       # Mild label smoothing for regularization
+    beam_soft_target_lambda: float = 0.1  # Soft neighborhood targets for beam structure
     beam_soft_target_tau: float = 1.5
-    focal_warmup_epochs: int = 0
-    moe_balance_warmup_epochs: int = 0
-    llm_warmup_epochs: int = 0
-    moe_only_warmup_epochs: int = 0
-    llm_top1_warmup_epochs: int = 0
+    focal_warmup_epochs: int = 3       # Ramp focal loss over first 3 epochs
+    moe_balance_warmup_epochs: int = 3  # Ramp MoE balance loss
+    llm_warmup_epochs: int = 2         # Head-only warmup for 2 epochs
+    moe_only_warmup_epochs: int = 2    # MoE-only warmup for 2 epochs
+    llm_top1_warmup_epochs: int = 2    # Top LLM layer warmup
     prior_match_warmup_epochs: int = 0
     reliability_monopoly_warmup_epochs: int = 0
     cvar_warmup_epochs: int = 0
